@@ -37,6 +37,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
@@ -56,12 +57,14 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyGridScope
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items as gridItems
@@ -104,6 +107,7 @@ import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.compositeOver
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
@@ -208,6 +212,7 @@ private const val KEY = "n_"
 private const val INPUT_KEY = "in_"
 private const val TV_ID = "__tv"
 private const val WALLPAPERS = 12
+private const val LOW_RAM_MB = 300   // por debajo de esto se avisa al abrir una app
 
 internal val Poppins = FontFamily(
     Font(R.font.poppins_regular, FontWeight.Normal),
@@ -237,8 +242,11 @@ private val CLOCK_TZ: TimeZone? = null
 private fun clockCal(millis: Long = System.currentTimeMillis()): Calendar =
     Calendar.getInstance(CLOCK_TZ ?: TimeZone.getDefault()).apply { timeInMillis = millis }
 
-private fun clockFmt(pattern: String): SimpleDateFormat =
-    SimpleDateFormat(pattern, Locale.getDefault()).apply { CLOCK_TZ?.let { timeZone = it } }
+/** La fecha siempre en español, aunque el sistema esté en otro idioma. */
+private val DATE_LOCALE = Locale("es", "MX")
+
+private fun clockFmt(pattern: String, locale: Locale = Locale.getDefault()): SimpleDateFormat =
+    SimpleDateFormat(pattern, locale).apply { CLOCK_TZ?.let { timeZone = it } }
 
 private fun daypart(): Int = clockCal().get(Calendar.HOUR_OF_DAY) / 6
 
@@ -261,6 +269,7 @@ class HomeActivity : ComponentActivity() {
 
     // canales: antena + IPTV
     private var showChannels by mutableStateOf(false)
+    private var chSearch by mutableStateOf(false)   // abrir canales con el foco en el buscador
     private var channels by mutableStateOf<List<TvChannel>>(emptyList())
     private var chStatus by mutableStateOf("")
     private var chLoading by mutableStateOf(false)
@@ -322,7 +331,8 @@ class HomeActivity : ComponentActivity() {
                         initialKey = prefs.getString("last_channel", null),
                         onCurrent = { prefs.edit().putString("last_channel", it).apply() },
                         onRefresh = { loadChannels(true) },
-                        onClose = { showChannels = false },
+                        startSearch = chSearch,
+                        onClose = { showChannels = false; chSearch = false },
                     )
                     else -> HomeScreen(
                         d = data,
@@ -379,9 +389,11 @@ class HomeActivity : ComponentActivity() {
             exitRest()
             return true
         }
-        if (keyCode == KeyEvent.KEYCODE_TV) {   // botón TV del control
-            openLiveTv()
-            return true
+        when (keyCode) {
+            KeyEvent.KEYCODE_TV -> { openLiveTv(); return true }                     // botón TV del control
+            KeyEvent.KEYCODE_GUIDE -> { chSearch = false; openChannels(); return true }  // guía: lista de canales
+            KeyEvent.KEYCODE_SEARCH -> { chSearch = true; openChannels(); return true }  // buscar: canales con el buscador
+            KeyEvent.KEYCODE_MENU, KeyEvent.KEYCODE_SETTINGS -> { openSettings(Settings.ACTION_SETTINGS); return true }  // botón de ajustes del control
         }
         return super.onKeyDown(keyCode, event)
     }
@@ -395,7 +407,7 @@ class HomeActivity : ComponentActivity() {
 
     private fun enterRest() {
         resting = true
-        setBrightness(0.01f)
+        setBrightness(REST_BRIGHTNESS)
     }
 
     private fun exitRest() {
@@ -556,7 +568,15 @@ class HomeActivity : ComponentActivity() {
 
     // --- acciones -----------------------------------------------------------------------------
 
+    private var lastRamWarn = 0L
+
     private fun launch(a: AppItem) {
+        val free = freeRamMb()
+        val now = System.currentTimeMillis()
+        if (free < LOW_RAM_MB && now - lastRamWarn > 10 * 60_000L) {
+            lastRamWarn = now
+            toast("Poca memoria libre ($free MB). Cierra apps en Sistema > Procesos")
+        }
         try {
             prefs.edit()
                 .putInt(KEY + a.pkg, prefs.getInt(KEY + a.pkg, 0) + 1)
@@ -618,6 +638,7 @@ class HomeActivity : ComponentActivity() {
             val errs = ArrayList<String>()
             val iptv = ArrayList<TvChannel>()
             val seen = HashSet<String>()
+            val names = HashSet<String>()
             for (src in sources) {
                 val file = File(filesDir, "iptv_${src.id}.m3u")
                 if (refresh || !file.exists()) {
@@ -630,7 +651,10 @@ class HomeActivity : ComponentActivity() {
                 if (file.exists()) {
                     runCatching { ChannelSources.parseM3u(file.readText(), src) }
                         .getOrDefault(emptyList())
-                        .forEach { if (it.url == null || seen.add(it.url)) iptv += it }
+                        .forEach {
+                            // sin repetidos: ni la misma URL ni el mismo nombre en otra lista
+                            if ((it.url == null || seen.add(it.url)) && names.add(it.name.lowercase())) iptv += it
+                        }
                 }
             }
             iptvDirty = false
@@ -1001,10 +1025,7 @@ private fun HomeScreen(
                 homeFocus = menuFocus,
                 account = account,
                 section = section,
-                hasServices = d.services.isNotEmpty(),
-                hasInputs = d.inputs.isNotEmpty(),
-                hasRec = d.rec.isNotEmpty(),
-                hasApps = d.apps.isNotEmpty(),
+                hasApps = d.services.isNotEmpty() || d.inputs.isNotEmpty() || d.rec.isNotEmpty() || d.apps.isNotEmpty(),
                 onSection = { section = it },
                 onLiveTv = onLiveTv,
                 onRest = onRest,
@@ -1016,24 +1037,30 @@ private fun HomeScreen(
             // el contenido ocupa todo lo que queda a la derecha del menú; el reloj se centra ahí
             Box(Modifier.weight(1f).fillMaxHeight()) {
                 when (section) {
-                    "svc" -> SectionGrid("Streaming", 190.dp) {
-                        gridItems(d.services, key = { it.pkg }) { a ->
-                            AppBanner(a, 176.dp, 99.dp, Modifier, onClick = { onApp(a) }, onLong = { onInfo(a) })
+                    "apps" -> SectionGrid("Apps", 190.dp) {
+                        if (d.services.isNotEmpty()) {
+                            gridHeader("Streaming")
+                            gridItems(d.services, key = { "svc_" + it.pkg }) { a ->
+                                AppBanner(a, 176.dp, 99.dp, Modifier, onClick = { onApp(a) }, onLong = { onInfo(a) })
+                            }
                         }
-                    }
-                    "inp" -> SectionGrid("Entradas", 200.dp) {
-                        gridItems(d.inputs, key = { it.id }) { i ->
-                            InputTile(i, Modifier, onClick = { onInput(i) }, onLong = { onInputLong(i) })
+                        if (d.inputs.isNotEmpty()) {
+                            gridHeader("Entradas")
+                            gridItems(d.inputs, key = { "inp_" + it.id }) { i ->
+                                InputTile(i, Modifier, onClick = { onInput(i) }, onLong = { onInputLong(i) })
+                            }
                         }
-                    }
-                    "rec" -> SectionGrid("Recomendadas", 166.dp) {
-                        gridItems(d.rec, key = { it.pkg }) { a ->
-                            AppBanner(a, 152.dp, 86.dp, Modifier, onClick = { onApp(a) }, onLong = { onInfo(a) })
+                        if (d.rec.isNotEmpty()) {
+                            gridHeader("Recomendadas")
+                            gridItems(d.rec, key = { "rec_" + it.pkg }) { a ->
+                                AppBanner(a, 152.dp, 86.dp, Modifier, onClick = { onApp(a) }, onLong = { onInfo(a) })
+                            }
                         }
-                    }
-                    "apps" -> SectionGrid("Apps", 166.dp) {
-                        gridItems(d.apps, key = { it.pkg }) { a ->
-                            AppBanner(a, 152.dp, 86.dp, Modifier, onClick = { onApp(a) }, onLong = { onInfo(a) })
+                        if (d.apps.isNotEmpty()) {
+                            gridHeader("Todas las apps")
+                            gridItems(d.apps, key = { "app_" + it.pkg }) { a ->
+                                AppBanner(a, 152.dp, 86.dp, Modifier, onClick = { onApp(a) }, onLong = { onInfo(a) })
+                            }
                         }
                     }
                     "sys" -> SectionGrid("Sistema", 190.dp) {
@@ -1054,6 +1081,19 @@ private fun HomeScreen(
         }
     }
 }
+
+private fun LazyGridScope.gridHeader(title: String) {
+    item(span = { GridItemSpan(maxLineSpan) }) {
+        Text(
+            title,
+            fontFamily = Poppins, fontSize = 15.sp, fontWeight = FontWeight.Medium,
+            color = SUBTLE_TEXT,
+            modifier = Modifier.padding(top = 6.dp),
+        )
+    }
+}
+
+private val SUBTLE_TEXT = Color(0xB3FFFFFF)
 
 @Composable
 private fun SectionGrid(title: String, minCell: Dp, content: LazyGridScope.() -> Unit) {
@@ -1121,8 +1161,8 @@ private fun Hero(modifier: Modifier = Modifier) {
         else -> "Buenas noches"
     }
     val time = clockFmt(if (is24) "HH:mm" else "h:mm").format(Date(now))
-    val ampm = if (is24) "" else clockFmt(" a").format(Date(now))
-    val date = clockFmt("EEEE d 'de' MMMM").format(Date(now))
+    val ampm = if (is24) "" else clockFmt(" a", Locale.US).format(Date(now))
+    val date = clockFmt("EEEE d 'de' MMMM", DATE_LOCALE).format(Date(now))
         .replaceFirstChar { it.uppercase() }
 
     Column(
@@ -1164,9 +1204,6 @@ private fun SideMenu(
     homeFocus: FocusRequester,
     account: String?,
     section: String,
-    hasServices: Boolean,
-    hasInputs: Boolean,
-    hasRec: Boolean,
     hasApps: Boolean,
     onSection: (String) -> Unit,
     onLiveTv: () -> Unit,
@@ -1192,12 +1229,6 @@ private fun SideMenu(
             modifier = Modifier.focusRequester(homeFocus), onFocus = { onSection("home") }) { onSection("home") }
         MenuItem("tv", Color.White, "En vivo", onClick = onLiveTv)
         MenuItem("display", Color.White, "Canales", onClick = onChannels)
-        if (hasServices) MenuItem("tv", Color.White, "Streaming", selected = section == "svc",
-            onFocus = { onSection("svc") }) { onSection("svc") }
-        if (hasInputs) MenuItem("display", Color.White, "Entradas", selected = section == "inp",
-            onFocus = { onSection("inp") }) { onSection("inp") }
-        if (hasRec) MenuItem("apps", Color.White, "Recomendadas", selected = section == "rec",
-            onFocus = { onSection("rec") }) { onSection("rec") }
         if (hasApps) MenuItem("apps", Color.White, "Apps", selected = section == "apps",
             onFocus = { onSection("apps") }) { onSection("apps") }
         MenuItem("procs", Color.White, "Sistema", selected = section == "sys",
@@ -1570,6 +1601,10 @@ internal fun Glyph(kind: String, color: Color, modifier: Modifier = Modifier, le
                 }
                 drawPath(head, color, style = line)
             }
+            "search" -> {
+                drawCircle(color, w * 0.28f, Offset(w * 0.43f, w * 0.43f), style = Stroke(width = sw))
+                drawLine(color, Offset(w * 0.64f, w * 0.64f), Offset(w * 0.86f, w * 0.86f), sw, StrokeCap.Round)
+            }
             "refresh" -> {
                 val r = w * 0.34f
                 val c0 = center
@@ -1768,8 +1803,11 @@ internal fun Pill(text: String, modifier: Modifier = Modifier, onClick: () -> Un
 }
 
 // ---------------------------------------------------------------------------------------------
-// Modo reposo: pantalla negra con el reloj a media luz que se mueve despacio (cuida el panel)
+// Modo reposo: paisajes con zoom lento y un reloj de vidrio que se desplaza despacio
 // ---------------------------------------------------------------------------------------------
+
+private const val REST_SLIDE_MS = 25_000L        // cada cuánto cambia la foto
+private const val REST_BRIGHTNESS = 0.35f        // brillo en reposo: suficiente para ver las fotos sin molestar
 
 @Composable
 private fun RestScreen() {
@@ -1777,33 +1815,88 @@ private fun RestScreen() {
     val now = rememberNow()
     val is24 = DateFormat.is24HourFormat(ctx)
     val time = clockFmt(if (is24) "HH:mm" else "h:mm").format(Date(now))
-    val date = clockFmt("EEEE d 'de' MMMM").format(Date(now)).replaceFirstChar { it.uppercase() }
+    val ampm = if (is24) "" else clockFmt(" a", Locale.US).format(Date(now))
+    val date = clockFmt("EEEE d 'de' MMMM", DATE_LOCALE).format(Date(now)).replaceFirstChar { it.uppercase() }
 
+    var idx by remember { mutableIntStateOf(Random.nextInt(WALLPAPERS)) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(REST_SLIDE_MS)
+            idx = (idx + 1) % WALLPAPERS
+        }
+    }
+
+    // el reloj cambia de sitio un poco cada minuto, muy despacio
     var tx by remember { mutableFloatStateOf(0f) }
     var ty by remember { mutableFloatStateOf(0f) }
     LaunchedEffect(now / 60_000L) {
-        tx = Random.nextFloat() * 1.4f - 0.7f
-        ty = Random.nextFloat() * 1.4f - 0.7f
+        tx = Random.nextFloat() * 2f - 1f
+        ty = Random.nextFloat() * 2f - 1f
     }
-    val ax by animateFloatAsState(tx, tween(6000), label = "x")
-    val ay by animateFloatAsState(ty, tween(6000), label = "y")
+    val ax by animateFloatAsState(tx, tween(20_000), label = "x")
+    val ay by animateFloatAsState(ty, tween(20_000), label = "y")
 
-    Box(
-        Modifier
-            .fillMaxSize()
-            .background(Color.Black),
-        contentAlignment = BiasAlignment(ax, ay),
-    ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(
-                time,
-                fontFamily = Poppins, fontSize = 64.sp, fontWeight = FontWeight.Bold,
-                color = Color(0x66FFFFFF),
-            )
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
+        Crossfade(targetState = idx, animationSpec = tween(2500), label = "rest") { i ->
+            val img = remember(i) { loadWallpaper(ctx, i) }
+            var go by remember { mutableStateOf(false) }
+            LaunchedEffect(Unit) { go = true }
+            val dir = if (i % 2 == 0) 1f else -1f
+            val zoom by animateFloatAsState(if (go) 1.18f else 1.04f, tween(30_000, easing = LinearEasing), label = "zoom")
+            val pan by animateFloatAsState(if (go) -dir * 36f else dir * 36f, tween(30_000, easing = LinearEasing), label = "pan")
+            if (img != null) {
+                Image(
+                    bitmap = img,
+                    contentDescription = null,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer { scaleX = zoom; scaleY = zoom; translationX = pan },
+                    contentScale = ContentScale.Crop,
+                )
+            }
+        }
+        // velo suave y más oscuro abajo, donde va el reloj
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        listOf(Color(0x40000000), Color(0x26000000), Color(0xA6000000)),
+                    )
+                )
+        )
+
+        val shape = RoundedCornerShape(32.dp)
+        Column(
+            Modifier
+                .align(Alignment.BottomStart)
+                .offset(x = (ax * 16).dp, y = (ay * 10).dp)
+                .padding(start = 56.dp, bottom = 52.dp)
+                .clip(shape)
+                .background(GlassFill)
+                .background(GlassSheen)
+                .border(glassBorder(shape).border, shape)
+                .padding(horizontal = 32.dp, vertical = 18.dp),
+        ) {
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text(
+                    time,
+                    fontFamily = Poppins, fontSize = 72.sp, fontWeight = FontWeight.Bold,
+                    color = Color(0xE6FFFFFF),
+                )
+                if (ampm.isNotEmpty()) {
+                    Text(
+                        ampm,
+                        fontFamily = Poppins, fontSize = 22.sp, fontWeight = FontWeight.Medium,
+                        color = Color(0xB3FFFFFF),
+                        modifier = Modifier.padding(bottom = 14.dp),
+                    )
+                }
+            }
             Text(
                 date,
-                fontFamily = Poppins, fontSize = 20.sp,
-                color = Color(0x66FFFFFF),
+                fontFamily = Poppins, fontSize = 18.sp,
+                color = Color(0xB3FFFFFF),
             )
         }
     }

@@ -4,6 +4,7 @@ package app.tvhome.launcher
 
 import android.content.Context
 import android.graphics.BitmapFactory
+import android.view.inputmethod.InputMethodManager
 import android.media.tv.TvContract
 import android.media.tv.TvInputInfo
 import android.media.tv.TvInputManager
@@ -37,8 +38,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -52,6 +56,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -69,6 +74,14 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -110,7 +123,92 @@ class TvChannel(
     val group: String?,
     val logo: String?,      // URL del logo (IPTV)
     val category: String? = null,   // "Deportes" para la lista de deportes
+    val quality: String? = null,    // "1080p" si el nombre original lo traía
+) {
+    /** Identificador que no cambia al recargar la lista (la clave `key` depende del orden). */
+    val stable: String get() = if (antenna) key else (url ?: key)
+}
+
+private val GROUP_ES = mapOf(
+    "business" to "Negocios", "news" to "Noticias", "sports" to "Deportes", "movies" to "Películas",
+    "entertainment" to "Entretenimiento", "general" to "General", "music" to "Música", "kids" to "Infantil",
+    "religious" to "Religión", "documentary" to "Documentales", "culture" to "Cultura",
+    "lifestyle" to "Estilo de vida", "education" to "Educación", "comedy" to "Comedia", "series" to "Series",
+    "animation" to "Animación", "weather" to "Clima", "travel" to "Viajes", "science" to "Ciencia",
+    "shop" to "Compras", "cooking" to "Cocina", "outdoor" to "Exteriores", "family" to "Familia",
+    "classic" to "Clásicos", "legislative" to "Legislativo", "public" to "Público", "auto" to "Autos",
+    "relax" to "Relax", "interactive" to "Interactivo", "undefined" to "General",
 )
+
+/** "Business;Documentary" -> "Negocios · Documentales". */
+private fun prettyGroup(raw: String?): String? =
+    raw?.split(';', ',')
+        ?.map { it.trim() }
+        ?.filter { it.isNotEmpty() }
+        ?.map { GROUP_ES[it.lowercase()] ?: it }
+        ?.distinct()
+        ?.joinToString(" · ")
+        ?.ifBlank { null }
+
+private val RE_QUALITY = Regex("""\s*\((\d{3,4}p)\)""")
+private val RE_TAG = Regex("""\s*\[[^\]]*\]""")
+
+/** Texto de apoyo bajo el nombre: grupo en español y, si se conoce, la calidad. */
+internal fun subtitleOf(c: TvChannel): String {
+    val base = if (c.antenna) "Antena" else (c.group ?: c.category ?: "IPTV")
+    return if (c.quality != null) "$base · ${c.quality}" else base
+}
+
+/** Favoritos, recientes y canales que no responden; se guardan en el equipo. */
+class ChannelPrefs(ctx: Context) {
+    private val sp = ctx.getSharedPreferences("channels", Context.MODE_PRIVATE)
+    private val deadTtl = 24L * 3600_000L
+
+    var favs by mutableStateOf(sp.getStringSet("fav", emptySet()).orEmpty().toSet())
+        private set
+    var recents by mutableStateOf(sp.getString("recents", "").orEmpty().split('\n').filter { it.isNotBlank() })
+        private set
+    var dead by mutableStateOf(readDead())
+        private set
+
+    private fun readDead(): Map<String, Long> {
+        val now = System.currentTimeMillis()
+        return sp.getString("dead", "").orEmpty().split('\n').mapNotNull {
+            val i = it.lastIndexOf('\t')
+            if (i <= 0) null else it.substring(0, i) to (it.substring(i + 1).toLongOrNull() ?: 0L)
+        }.filter { now - it.second < deadTtl }.toMap()
+    }
+
+    private fun saveDead() =
+        sp.edit().putString("dead", dead.entries.joinToString("\n") { it.key + "\t" + it.value }).apply()
+
+    fun toggleFav(id: String) {
+        favs = if (id in favs) favs - id else favs + id
+        sp.edit().putStringSet("fav", favs).apply()
+    }
+
+    fun played(id: String) {
+        recents = (listOf(id) + recents.filter { it != id }).take(20)
+        sp.edit().putString("recents", recents.joinToString("\n")).apply()
+    }
+
+    fun markDead(id: String) {
+        if (id in dead) return
+        dead = dead + (id to System.currentTimeMillis())
+        saveDead()
+    }
+
+    fun revive(id: String) {
+        if (id !in dead) return
+        dead = dead - id
+        saveDead()
+    }
+
+    fun clearDead() {
+        dead = emptyMap()
+        saveDead()
+    }
+}
 
 /** Una lista M3U de IPTV. La categoría (p. ej. "Deportes") sirve para separarla con un filtro. */
 class IptvSource(val id: String, val label: String, val url: String, val category: String?)
@@ -128,6 +226,7 @@ val DEFAULT_SOURCES = listOf(
         "https://iptv-org.github.io/iptv/countries/$IPTV_COUNTRY.m3u", null,
     ),
     IptvSource("sports", "Deportes", "https://iptv-org.github.io/iptv/categories/sports.m3u", "Deportes"),
+    IptvSource("business", "Negocios", "https://iptv-org.github.io/iptv/categories/business.m3u", "Negocios"),
 )
 
 object ChannelSources {
@@ -187,15 +286,18 @@ object ChannelSources {
             } else if (!l.startsWith("#")) {
                 if (name != null && (l.startsWith("http://") || l.startsWith("https://"))) {
                     n++
+                    val quality = RE_QUALITY.find(name)?.groupValues?.get(1)
+                    val clean = name.replace(RE_QUALITY, "").replace(RE_TAG, "").trim()
                     out += TvChannel(
                         key = "${src.id}_$n",
-                        name = name.ifBlank { "Canal $n" },
+                        name = clean.ifBlank { "Canal $n" },
+                        quality = quality,
                         number = attrs["tvg-chno"],
                         antenna = false,
                         inputId = null,
                         channelId = 0L,
                         url = l,
-                        group = attrs["group-title"],
+                        group = prettyGroup(attrs["group-title"]),
                         logo = attrs["tvg-logo"]?.takeIf { it.startsWith("http") },
                         category = src.category,
                     )
@@ -265,16 +367,13 @@ private fun loadLogo(url: String): ImageBitmap? = runCatching {
 // Pantalla de canales
 // ---------------------------------------------------------------------------------------------
 
-private val NEON_ANT = Color(0xFF7CC4FF)
-private val NEON_IPTV = Color(0xFFFF6FB5)
-private val NEON_SPORT = Color(0xFF2BE38B)
+// Estilo glass: sin color propio por fuente; solo blanco y tonos translúcidos
+private val NEON_ANT = Color.White
 private val RED = Color(0xFFFF6B6B)
+private val SUBTLE = Color(0xB3FFFFFF)
 
-private fun neonOf(c: TvChannel): Color = when {
-    c.antenna -> NEON_ANT
-    c.category != null -> NEON_SPORT
-    else -> NEON_IPTV
-}
+@Suppress("UNUSED_PARAMETER")
+private fun neonOf(c: TvChannel): Color = Color.White
 
 private const val ST_LOADING = 0
 private const val ST_PLAYING = 1
@@ -290,20 +389,35 @@ fun ChannelsScreen(
     initialKey: String?,
     onCurrent: (String) -> Unit,
     onRefresh: () -> Unit,
+    startSearch: Boolean = false,
     onClose: () -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
-    var filter by remember { mutableIntStateOf(0) }        // 0 todos, 1 antena, 2 IPTV, 3 deportes
+    val ctx = LocalContext.current
+    val store = remember { ChannelPrefs(ctx) }
+    var filter by remember { mutableIntStateOf(0) }        // 0 todos, 1 favoritos, 2 recientes, 3 antena, 4 IPTV, 5 deportes, 6 negocios
+    var query by remember { mutableStateOf("") }
     var curKey by remember { mutableStateOf(initialKey) }
     var full by remember { mutableStateOf(false) }
-    val visible = remember(channels, filter) {
-        when (filter) {
-            1 -> channels.filter { it.antenna }
-            2 -> channels.filter { !it.antenna && it.category == null }
-            3 -> channels.filter { it.category != null }
+    val visible = remember(channels, filter, query, store.favs, store.recents, store.dead, curKey) {
+        val base = when (filter) {
+            1 -> channels.filter { it.stable in store.favs }
+            2 -> store.recents.mapNotNull { id -> channels.firstOrNull { it.stable == id } }
+            3 -> channels.filter { it.antenna }
+            4 -> channels.filter { !it.antenna && it.category == null }
+            5 -> channels.filter { it.category == "Deportes" }
+            6 -> channels.filter { it.category == "Negocios" }
             else -> channels
+        }.filter { it.antenna || it.stable !in store.dead || it.key == curKey }   // los que no responden se ocultan
+        val q = query.trim()
+        if (q.isEmpty()) base
+        else base.filter {
+            it.name.contains(q, ignoreCase = true) || it.number == q ||
+                (it.group?.contains(q, ignoreCase = true) == true)
         }
     }
+    val hiddenDead = remember(channels, store.dead) { channels.count { !it.antenna && it.stable in store.dead } }
+    val focusManager = LocalFocusManager.current
     val current = remember(channels, curKey) { channels.firstOrNull { it.key == curKey } }
     // fila que recibe el foco: el canal actual si está en el filtro; si no, el primero
     val focusKey = visible.firstOrNull { it.key == curKey }?.key ?: visible.firstOrNull()?.key
@@ -315,9 +429,11 @@ fun ChannelsScreen(
 
     val videoFr = remember { FocusRequester() }
     val rowFr = remember { FocusRequester() }
+    val searchFr = remember { FocusRequester() }
     val listState = rememberLazyListState()
 
     fun play(c: TvChannel) {
+        store.played(c.stable)
         curKey = c.key
         onCurrent(c.key)
     }
@@ -327,6 +443,13 @@ fun ChannelsScreen(
         val i = visible.indexOfFirst { it.key == curKey }
         val n = if (i < 0) 0 else (i + d + visible.size) % visible.size
         play(visible[n])
+    }
+
+    // en pantalla completa: nombres del canal siguiente (▲) y anterior (▼)
+    val peek = remember(visible, curKey) {
+        val i = visible.indexOfFirst { it.key == curKey }
+        val n = visible.size
+        if (i < 0 || n < 2) null else "▲ ${visible[(i + 1) % n].name}     ▼ ${visible[(i - 1 + n) % n].name}"
     }
 
     BackHandler(enabled = full) { full = false }
@@ -351,6 +474,22 @@ fun ChannelsScreen(
         if (full && showInfo) {
             delay(3500)
             showInfo = false
+        }
+    }
+    LaunchedEffect(query, filter) { listState.scrollToItem(0) }
+    // un canal IPTV que no responde se oculta un día; si vuelve a reproducir, reaparece
+    LaunchedEffect(state, curKey) {
+        val c = current
+        if (c != null && !c.antenna) {
+            if (state == ST_ERROR) store.markDead(c.stable)
+            else if (state == ST_PLAYING) store.revive(c.stable)
+        }
+    }
+    // abierto con la tecla de buscar: el foco va al buscador (después de que la lista tome el suyo)
+    LaunchedEffect(startSearch, visible.isNotEmpty()) {
+        if (startSearch && !full) {
+            delay(350)
+            runCatching { searchFr.requestFocus() }
         }
     }
     LaunchedEffect(curKey) {
@@ -404,6 +543,7 @@ fun ChannelsScreen(
             focus = videoFr,
             onState = { s, n -> state = s; note = n },
             retry = retry,
+            peek = peek,
             onClick = {
                 when {
                     state == ST_ERROR -> {
@@ -425,44 +565,102 @@ fun ChannelsScreen(
         )
 
         if (!full) {
-            // --- título e iconos, arriba a la derecha
-            Row(
+            // --- panel de vidrio a la derecha: título, iconos y lista
+            val panelShape = RoundedCornerShape(28.dp)
+            Column(
                 Modifier
                     .align(Alignment.TopEnd)
-                    .padding(end = EDGE)
-                    .width(listW)
-                    .height(HEADER_H),
-                verticalAlignment = Alignment.CenterVertically,
+                    .padding(end = 20.dp, top = 16.dp, bottom = 16.dp)
+                    .width(listW + 20.dp)
+                    .fillMaxHeight()
+                    .clip(panelShape)
+                    .background(GlassFill)
+                    .background(GlassSheen)
+                    .border(glassBorder(panelShape).border, panelShape),
             ) {
-                Glyph("tv", Color.White, Modifier.size(26.dp))
-                Spacer(Modifier.width(10.dp))
-                Text(
-                    "Canales",
-                    fontFamily = Poppins, fontSize = 20.sp, fontWeight = FontWeight.Bold,
-                    color = cs.onBackground,
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .height(HEADER_H)
+                        .padding(horizontal = 18.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Glyph("tv", Color.White, Modifier.size(24.dp))
+                    Spacer(Modifier.width(10.dp))
+                    Text(
+                        "Canales",
+                        fontFamily = Poppins, fontSize = 20.sp, fontWeight = FontWeight.Bold,
+                        color = Color.White,
+                    )
+                    Spacer(Modifier.weight(1f))
+                    IconPill("refresh", Color.White) { store.clearDead(); onRefresh() }
+                    Spacer(Modifier.width(8.dp))
+                    IconPill("back", Color.White) { onClose() }
+                }
+
+                SearchField(
+                    value = query,
+                    onChange = { query = it },
+                    modifier = Modifier.padding(start = 14.dp, end = 14.dp, bottom = 8.dp).focusRequester(searchFr),
+                    onDone = { focusManager.moveFocus(FocusDirection.Down) },
                 )
-                Spacer(Modifier.weight(1f))
-                IconPill("refresh", Color.White) { onRefresh() }
-                Spacer(Modifier.width(8.dp))
-                IconPill("back", Color.White) { onClose() }
+
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 14.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    if (visible.isEmpty() && !loading) {
+                        item {
+                            Text(
+                                "Sin resultados",
+                                fontFamily = Poppins, fontSize = 13.sp, color = SUBTLE,
+                                modifier = Modifier.padding(start = 8.dp, top = 8.dp),
+                            )
+                        }
+                    }
+                    itemsIndexed(visible, key = { _, c -> c.key }) { _, c ->
+                        ChannelRow(
+                            c,
+                            selected = c.key == curKey,
+                            fav = c.stable in store.favs,
+                            modifier = if (c.key == focusKey) Modifier.focusRequester(rowFr) else Modifier,
+                            onLong = { store.toggleFav(c.stable) },
+                        ) { play(c) }
+                    }
+                }
             }
 
             // --- columna izquierda, debajo del video: filtros y datos del canal actual
+            val infoShape = RoundedCornerShape(24.dp)
             Column(
                 Modifier
-                    .padding(start = EDGE, top = vh + 12.dp)
-                    .width(vw - EDGE),
+                    .padding(start = 12.dp, top = vh + 14.dp)
+                    .width(vw - 24.dp)
+                    .clip(infoShape)
+                    .background(GlassFill)
+                    .background(GlassSheen)
+                    .border(glassBorder(infoShape).border, infoShape)
+                    .padding(12.dp),
             ) {
                 val nAnt = channels.count { it.antenna }
-                val nSport = channels.count { it.category != null }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    FilterChip("Todos ${channels.size}", filter == 0) { filter = 0 }
-                    Spacer(Modifier.width(6.dp))
-                    FilterChip("Antena $nAnt", filter == 1) { filter = 1 }
-                    Spacer(Modifier.width(6.dp))
-                    FilterChip("IPTV ${channels.size - nAnt - nSport}", filter == 2) { filter = 2 }
-                    Spacer(Modifier.width(6.dp))
-                    FilterChip("Deportes $nSport", filter == 3) { filter = 3 }
+                val nSport = channels.count { it.category == "Deportes" }
+                val nBiz = channels.count { it.category == "Negocios" }
+                val nIptv = channels.count { !it.antenna && it.category == null }
+                val chips = buildList {
+                    add(0 to "Todos ${channels.size}")
+                    add(1 to "Favoritos ${store.favs.size}")
+                    add(2 to "Recientes ${store.recents.size}")
+                    if (nAnt > 0) add(3 to "Antena $nAnt")
+                    add(4 to "IPTV $nIptv")
+                    add(5 to "Deportes $nSport")
+                    add(6 to "Negocios $nBiz")
+                }
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    items(chips, key = { it.first }) { (i, label) ->
+                        FilterChip(label, filter == i) { filter = i }
+                    }
                 }
                 Spacer(Modifier.height(12.dp))
                 if (current != null) {
@@ -482,12 +680,12 @@ fun ChannelsScreen(
                         )
                     }
                     Text(
-                        if (current.antenna) "Antena" else (current.group ?: current.category ?: "IPTV"),
-                        fontFamily = Poppins, fontSize = 12.sp, color = neonOf(current), maxLines = 1,
+                        subtitleOf(current),
+                        fontFamily = Poppins, fontSize = 12.sp, color = SUBTLE, maxLines = 1,
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "OK sobre el video: pantalla completa",
+                        "OK sobre el video: pantalla completa · Mantén OK en un canal: favorito",
                         fontFamily = Poppins, fontSize = 11.sp, color = cs.onSurfaceVariant,
                     )
                 } else {
@@ -496,7 +694,10 @@ fun ChannelsScreen(
                         fontFamily = Poppins, fontSize = 14.sp, color = cs.onSurfaceVariant,
                     )
                 }
-                val line = if (loading) "Cargando lista de canales…" else status
+                val line = if (loading) "Cargando lista de canales…" else listOf(
+                    status,
+                    if (hiddenDead > 0) "$hiddenDead canales ocultos por no responder (Recargar los muestra otra vez)" else "",
+                ).filter { it.isNotBlank() }.joinToString("\n")
                 if (line.isNotBlank()) {
                     Spacer(Modifier.height(8.dp))
                     Text(
@@ -506,25 +707,6 @@ fun ChannelsScreen(
                 }
             }
 
-            // --- lista a la derecha
-            LazyColumn(
-                state = listState,
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(end = EDGE, top = HEADER_H)
-                    .width(listW)
-                    .fillMaxHeight(),
-                contentPadding = PaddingValues(vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                itemsIndexed(visible, key = { _, c -> c.key }) { _, c ->
-                    ChannelRow(
-                        c,
-                        selected = c.key == curKey,
-                        modifier = if (c.key == focusKey) Modifier.focusRequester(rowFr) else Modifier,
-                    ) { play(c) }
-                }
-            }
         }
     }
 }
@@ -541,6 +723,7 @@ private fun VideoPane(
     focus: FocusRequester,
     retry: Int,
     onState: (Int, String?) -> Unit,
+    peek: String?,
     onClick: () -> Unit,
     onKey: (Int) -> Boolean,
 ) {
@@ -590,7 +773,8 @@ private fun VideoPane(
                             .align(Alignment.BottomStart)
                             .padding(if (full) 32.dp else 10.dp)
                             .clip(RoundedCornerShape(50))
-                            .background(Color(0xB3000000))
+                            .background(Color(0x99000000))
+                            .border(glassBorder(RoundedCornerShape(50)).border, RoundedCornerShape(50))
                             .padding(horizontal = 12.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
@@ -646,8 +830,9 @@ private fun VideoPane(
                         Modifier
                             .align(Alignment.TopStart)
                             .padding(EDGE)
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(Color(0xB3000000))
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(Color(0x99000000))
+                            .border(glassBorder(RoundedCornerShape(20.dp)).border, RoundedCornerShape(20.dp))
                             .padding(horizontal = 16.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
@@ -665,9 +850,15 @@ private fun VideoPane(
                                 color = Color.White, maxLines = 1,
                             )
                             Text(
-                                if (current.antenna) "Antena" else (current.group ?: current.category ?: "IPTV"),
-                                fontFamily = Poppins, fontSize = 12.sp, color = neon, maxLines = 1,
+                                subtitleOf(current),
+                                fontFamily = Poppins, fontSize = 12.sp, color = SUBTLE, maxLines = 1,
                             )
+                            if (peek != null) {
+                                Text(
+                                    peek,
+                                    fontFamily = Poppins, fontSize = 11.sp, color = SUBTLE, maxLines = 1,
+                                )
+                            }
                         }
                     }
                 }
@@ -679,8 +870,8 @@ private fun VideoPane(
                 Modifier
                     .fillMaxSize()
                     .border(
-                        if (focused) 3.dp else 1.5.dp,
-                        neon.copy(alpha = if (focused) 1f else 0.35f),
+                        if (focused) 2.dp else 1.dp,
+                        Color.White.copy(alpha = if (focused) 0.9f else 0.25f),
                         RectangleShape,
                     )
             )
@@ -702,6 +893,61 @@ private fun Spinner(size: Dp, color: Color) {
         val box = Size(this.size.width - sw, this.size.height - sw)
         drawArc(color.copy(alpha = 0.25f), 0f, 360f, false, Offset(inset, inset), box, style = Stroke(sw))
         drawArc(color, a, 100f, false, Offset(inset, inset), box, style = Stroke(sw, cap = StrokeCap.Round))
+    }
+}
+
+/** Buscador de vidrio: al pulsar OK sobre él se abre el teclado en pantalla. */
+@Composable
+private fun SearchField(value: String, onChange: (String) -> Unit, modifier: Modifier = Modifier, onDone: () -> Unit) {
+    var focused by remember { mutableStateOf(false) }
+    val keyboard = LocalSoftwareKeyboardController.current
+    val ctx = LocalContext.current
+    val hasIme = remember {
+        runCatching {
+            (ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).enabledInputMethodList.isNotEmpty()
+        }.getOrDefault(true)
+    }
+    val shape = RoundedCornerShape(50)
+    Row(
+        modifier
+            .fillMaxWidth()
+            .height(40.dp)
+            .clip(shape)
+            .background(if (focused) GlassFillFocus else GlassFill)
+            .border(glassBorder(shape, focused).border, shape)
+            .padding(horizontal = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Glyph("search", Color.White, Modifier.size(18.dp))
+        Spacer(Modifier.width(10.dp))
+        Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+            if (value.isEmpty()) {
+                Text(if (hasIme) "Buscar canal" else "Sin teclado instalado", fontFamily = Poppins, fontSize = 13.sp, color = SUBTLE, maxLines = 1)
+            }
+            BasicTextField(
+                value = value,
+                onValueChange = onChange,
+                singleLine = true,
+                textStyle = TextStyle(color = Color.White, fontSize = 14.sp, fontFamily = Poppins),
+                cursorBrush = SolidColor(Color.White),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions = KeyboardActions(onSearch = { keyboard?.hide(); onDone() }),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onFocusChanged { focused = it.isFocused }
+                    .onPreviewKeyEvent { e ->
+                        val code = e.nativeKeyEvent.keyCode
+                        if (e.type == KeyEventType.KeyDown &&
+                            (code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER)
+                        ) {
+                            keyboard?.show()
+                            true
+                        } else {
+                            false
+                        }
+                    },
+            )
+        }
     }
 }
 
@@ -732,72 +978,93 @@ private fun FilterChip(text: String, selected: Boolean, onClick: () -> Unit) {
             Modifier
                 .fillMaxHeight()
                 .background(GlassSheen)
-                .padding(horizontal = 14.dp),
+                .padding(horizontal = 10.dp),
             contentAlignment = Alignment.Center,
         ) {
-            Text(text, fontFamily = Poppins, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1)
+            Text(text, fontFamily = Poppins, fontSize = 12.sp, fontWeight = FontWeight.Medium, maxLines = 1)
         }
     }
 }
 
-/** Fila de la lista: número o logo, nombre y bandera. El canal que se está viendo lleva el neón más fuerte. */
+/** Fila de la lista: logo o número en un recuadro de vidrio, nombre y grupo. El canal en reproducción lleva vidrio más claro y un punto. */
 @Composable
-private fun ChannelRow(c: TvChannel, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
-    val neon = neonOf(c)
-    val shape = RoundedCornerShape(R_NORMAL)
-    val focusShape = RoundedCornerShape(R_FOCUS)
+private fun ChannelRow(
+    c: TvChannel,
+    selected: Boolean,
+    fav: Boolean,
+    modifier: Modifier,
+    onLong: () -> Unit,
+    onClick: () -> Unit,
+) {
+    val shape = RoundedCornerShape(20.dp)
     val logo = rememberLogo(c.logo)
     Surface(
         onClick = onClick,
+        onLongClick = onLong,
         modifier = modifier
             .fillMaxWidth()
-            .height(54.dp),
-        shape = ClickableSurfaceDefaults.shape(shape = shape, focusedShape = focusShape),
+            .height(56.dp),
+        shape = ClickableSurfaceDefaults.shape(shape = shape),
         colors = ClickableSurfaceDefaults.colors(
-            containerColor = if (selected) Color(0xE6252030) else Color(0xCC1D1B22),
-            focusedContainerColor = Color(0xF21D1B22),
-            pressedContainerColor = Color(0xF21D1B22),
+            containerColor = if (selected) GlassFill else Color.Transparent,
+            contentColor = Color.White,
+            focusedContainerColor = GlassFillFocus,
+            focusedContentColor = GlassInk,
+            pressedContainerColor = GlassFillFocus,
+            pressedContentColor = GlassInk,
         ),
-        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.04f),
+        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.03f),
         border = ClickableSurfaceDefaults.border(
-            border = Border(BorderStroke(if (selected) 2.dp else 1.5.dp, neon.copy(alpha = if (selected) 0.9f else 0.3f)), shape = shape),
-            focusedBorder = Border(BorderStroke(3.dp, neon), shape = focusShape),
+            border = if (selected) glassBorder(shape) else Border.None,
+            focusedBorder = glassBorder(shape, focused = true),
         ),
-        glow = ClickableSurfaceDefaults.glow(
-            focusedGlow = Glow(elevationColor = neon.copy(alpha = 0.9f), elevation = GLOW),
-        ),
+        glow = ClickableSurfaceDefaults.glow(focusedGlow = glassGlow()),
     ) {
         Row(
             Modifier
                 .fillMaxSize()
-                .padding(horizontal = 12.dp),
+                .padding(horizontal = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Box(Modifier.width(44.dp), contentAlignment = Alignment.Center) {
+            Box(
+                Modifier
+                    .size(42.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(if (logo != null) Color(0xF2F2F2F7) else GlassFill),
+                contentAlignment = Alignment.Center,
+            ) {
                 if (logo != null) {
-                    Image(logo, null, Modifier.size(36.dp), contentScale = ContentScale.Fit)
+                    Image(logo, null, Modifier.size(32.dp), contentScale = ContentScale.Fit)
                 } else if (!c.number.isNullOrBlank()) {
                     Text(
                         c.number,
-                        fontFamily = Poppins, fontSize = 15.sp, fontWeight = FontWeight.Bold,
-                        color = neon, maxLines = 1,
+                        fontFamily = Poppins, fontSize = 14.sp, fontWeight = FontWeight.Bold,
+                        maxLines = 1,
                     )
                 } else {
-                    Glyph("tv", neon, Modifier.size(22.dp))
+                    Glyph("tv", Color.White, Modifier.size(20.dp))
                 }
             }
-            Spacer(Modifier.width(10.dp))
+            Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(
                     c.name,
                     fontFamily = Poppins, fontSize = 13.sp, fontWeight = FontWeight.Medium,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.White,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    if (c.antenna) "Antena" else (c.group ?: c.category ?: "IPTV"),
+                    subtitleOf(c),
                     fontFamily = Poppins, fontSize = 10.sp,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis, color = neon,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, color = SUBTLE,
                 )
+            }
+            if (fav) {
+                Text("★", fontSize = 15.sp, color = Color(0xFFFFD27A))
+                Spacer(Modifier.width(8.dp))
+            }
+            if (selected) {
+                Box(Modifier.size(8.dp).clip(CircleShape).background(Color.White))
+                Spacer(Modifier.width(6.dp))
             }
         }
     }
@@ -810,7 +1077,12 @@ private fun ChannelRow(c: TvChannel, selected: Boolean, modifier: Modifier, onCl
 @Composable
 private fun IptvVideo(url: String, onState: (Int, String?) -> Unit) {
     val ctx = LocalContext.current
-    val player = remember(url) { ExoPlayer.Builder(ctx).build() }
+    val player = remember(url) {
+        ExoPlayer.Builder(ctx).build().apply {
+            // con 1,7 GB de RAM un 4K no cabe: se limita a 1080p
+            trackSelectionParameters = trackSelectionParameters.buildUpon().setMaxVideoSize(1920, 1080).build()
+        }
+    }
     DisposableEffect(player) {
         val l = object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
