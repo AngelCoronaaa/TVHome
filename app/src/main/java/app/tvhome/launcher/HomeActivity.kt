@@ -308,7 +308,7 @@ class HomeActivity : ComponentActivity() {
                 when {
                     resting -> exitRest()
                     showProcs -> showProcs = false
-                    showChannels -> showChannels = false
+                    showChannels -> { showChannels = false; chSearch = false }
                     else -> tick++
                 }
             }
@@ -638,7 +638,6 @@ class HomeActivity : ComponentActivity() {
             val errs = ArrayList<String>()
             val iptv = ArrayList<TvChannel>()
             val seen = HashSet<String>()
-            val names = HashSet<String>()
             for (src in sources) {
                 val file = File(filesDir, "iptv_${src.id}.m3u")
                 if (refresh || !file.exists()) {
@@ -651,10 +650,7 @@ class HomeActivity : ComponentActivity() {
                 if (file.exists()) {
                     runCatching { ChannelSources.parseM3u(file.readText(), src) }
                         .getOrDefault(emptyList())
-                        .forEach {
-                            // sin repetidos: ni la misma URL ni el mismo nombre en otra lista
-                            if ((it.url == null || seen.add(it.url)) && names.add(it.name.lowercase())) iptv += it
-                        }
+                        .forEach { if (it.url == null || seen.add(it.url)) iptv += it }
                 }
             }
             iptvDirty = false

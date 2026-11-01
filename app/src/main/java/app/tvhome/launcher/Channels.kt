@@ -159,28 +159,14 @@ internal fun subtitleOf(c: TvChannel): String {
     return if (c.quality != null) "$base · ${c.quality}" else base
 }
 
-/** Favoritos, recientes y canales que no responden; se guardan en el equipo. */
+/** Favoritos y recientes; se guardan en el equipo. */
 class ChannelPrefs(ctx: Context) {
     private val sp = ctx.getSharedPreferences("channels", Context.MODE_PRIVATE)
-    private val deadTtl = 24L * 3600_000L
 
     var favs by mutableStateOf(sp.getStringSet("fav", emptySet()).orEmpty().toSet())
         private set
     var recents by mutableStateOf(sp.getString("recents", "").orEmpty().split('\n').filter { it.isNotBlank() })
         private set
-    var dead by mutableStateOf(readDead())
-        private set
-
-    private fun readDead(): Map<String, Long> {
-        val now = System.currentTimeMillis()
-        return sp.getString("dead", "").orEmpty().split('\n').mapNotNull {
-            val i = it.lastIndexOf('\t')
-            if (i <= 0) null else it.substring(0, i) to (it.substring(i + 1).toLongOrNull() ?: 0L)
-        }.filter { now - it.second < deadTtl }.toMap()
-    }
-
-    private fun saveDead() =
-        sp.edit().putString("dead", dead.entries.joinToString("\n") { it.key + "\t" + it.value }).apply()
 
     fun toggleFav(id: String) {
         favs = if (id in favs) favs - id else favs + id
@@ -190,23 +176,6 @@ class ChannelPrefs(ctx: Context) {
     fun played(id: String) {
         recents = (listOf(id) + recents.filter { it != id }).take(20)
         sp.edit().putString("recents", recents.joinToString("\n")).apply()
-    }
-
-    fun markDead(id: String) {
-        if (id in dead) return
-        dead = dead + (id to System.currentTimeMillis())
-        saveDead()
-    }
-
-    fun revive(id: String) {
-        if (id !in dead) return
-        dead = dead - id
-        saveDead()
-    }
-
-    fun clearDead() {
-        dead = emptyMap()
-        saveDead()
     }
 }
 
@@ -399,7 +368,7 @@ fun ChannelsScreen(
     var query by remember { mutableStateOf("") }
     var curKey by remember { mutableStateOf(initialKey) }
     var full by remember { mutableStateOf(false) }
-    val visible = remember(channels, filter, query, store.favs, store.recents, store.dead, curKey) {
+    val visible = remember(channels, filter, query, store.favs, store.recents) {
         val base = when (filter) {
             1 -> channels.filter { it.stable in store.favs }
             2 -> store.recents.mapNotNull { id -> channels.firstOrNull { it.stable == id } }
@@ -408,7 +377,7 @@ fun ChannelsScreen(
             5 -> channels.filter { it.category == "Deportes" }
             6 -> channels.filter { it.category == "Negocios" }
             else -> channels
-        }.filter { it.antenna || it.stable !in store.dead || it.key == curKey }   // los que no responden se ocultan
+        }
         val q = query.trim()
         if (q.isEmpty()) base
         else base.filter {
@@ -416,7 +385,6 @@ fun ChannelsScreen(
                 (it.group?.contains(q, ignoreCase = true) == true)
         }
     }
-    val hiddenDead = remember(channels, store.dead) { channels.count { !it.antenna && it.stable in store.dead } }
     val focusManager = LocalFocusManager.current
     val current = remember(channels, curKey) { channels.firstOrNull { it.key == curKey } }
     // fila que recibe el foco: el canal actual si está en el filtro; si no, el primero
@@ -477,18 +445,10 @@ fun ChannelsScreen(
         }
     }
     LaunchedEffect(query, filter) { listState.scrollToItem(0) }
-    // un canal IPTV que no responde se oculta un día; si vuelve a reproducir, reaparece
-    LaunchedEffect(state, curKey) {
-        val c = current
-        if (c != null && !c.antenna) {
-            if (state == ST_ERROR) store.markDead(c.stable)
-            else if (state == ST_PLAYING) store.revive(c.stable)
-        }
-    }
     // abierto con la tecla de buscar: el foco va al buscador (después de que la lista tome el suyo)
     LaunchedEffect(startSearch, visible.isNotEmpty()) {
         if (startSearch && !full) {
-            delay(350)
+            delay(900)
             runCatching { searchFr.requestFocus() }
         }
     }
@@ -593,7 +553,7 @@ fun ChannelsScreen(
                         color = Color.White,
                     )
                     Spacer(Modifier.weight(1f))
-                    IconPill("refresh", Color.White) { store.clearDead(); onRefresh() }
+                    IconPill("refresh", Color.White) { onRefresh() }
                     Spacer(Modifier.width(8.dp))
                     IconPill("back", Color.White) { onClose() }
                 }
@@ -694,10 +654,7 @@ fun ChannelsScreen(
                         fontFamily = Poppins, fontSize = 14.sp, color = cs.onSurfaceVariant,
                     )
                 }
-                val line = if (loading) "Cargando lista de canales…" else listOf(
-                    status,
-                    if (hiddenDead > 0) "$hiddenDead canales ocultos por no responder (Recargar los muestra otra vez)" else "",
-                ).filter { it.isNotBlank() }.joinToString("\n")
+                val line = if (loading) "Cargando lista de canales…" else status
                 if (line.isNotBlank()) {
                     Spacer(Modifier.height(8.dp))
                     Text(
